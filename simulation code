@@ -1,0 +1,987 @@
+import pygame
+import math
+import random
+import numpy as np
+from typing import List, Tuple, Dict, Set
+from queue import PriorityQueue
+from tabulate import tabulate
+import os
+import time
+import matplotlib.pyplot as plt
+import pandas as pd
+from dataclasses import dataclass
+from typing import List, Dict
+import json
+from datetime import datetime
+
+# Constants
+SCREEN_WIDTH = 800
+SCREEN_HEIGHT = 600
+NUM_ROBOTS = 3
+NUM_OBSTACLES = 10
+NUM_STATIONS = 6
+MAX_STEPS = 5000
+FPS = 120
+LIDAR_RANGE = 100
+COMMUNICATION_RANGE = 150
+
+# Colors
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+RED = (255, 0, 0)
+BLUE = (0, 0, 255)
+YELLOW = (255, 255, 0)
+GREY = (128, 128, 128)
+GREEN = (0, 255, 0)
+
+# Grid settings for Theta*
+GRID_SIZE = 20
+GRID_WIDTH = SCREEN_WIDTH // GRID_SIZE
+GRID_HEIGHT = SCREEN_HEIGHT // GRID_SIZE
+
+class Obstacle:
+    def __init__(self, x: int, y: int, radius: int):
+        self.x = x
+        self.y = y
+        self.radius = radius
+
+    def collides_with(self, x: int, y: int) -> bool:
+        return math.sqrt((self.x - x)**2 + (self.y - y)**2) < self.radius + 5
+
+    def render(self, screen):
+        pygame.draw.circle(screen, RED, (int(self.x), int(self.y)), self.radius)
+@dataclass
+class PerformanceMetrics:
+    timestamp: float
+    delivered_packages: int
+    avg_robot_speed: float
+    collision_count: int
+    path_length: float
+    robot_idle_time: float
+    completion_percentage: float
+
+class PerformanceMonitor:
+    def __init__(self, output_dir=None):
+        self.metrics_history: List[PerformanceMetrics] = []
+        self.start_time = time.time()
+        self.collision_count = 0
+        self.robot_positions = {}
+        self.last_collection_time = time.time()
+        self.collection_interval = 1.0
+        self.output_dir = output_dir
+
+    def update(self, env):
+        """Update performance metrics"""
+        current_time = time.time()
+        if current_time - self.last_collection_time < self.collection_interval:
+            return
+
+        try:
+            # Calculate average robot speed
+            total_speed = 0
+            total_path_length = 0
+            total_idle_time = 0
+
+            for robot in env.robots:
+                if robot.id in self.robot_positions:
+                    last_pos = self.robot_positions[robot.id]
+                    dx = robot.x - last_pos[0]
+                    dy = robot.y - last_pos[1]
+                    distance = (dx ** 2 + dy ** 2) ** 0.5
+                    total_speed += distance / self.collection_interval
+                    total_path_length += distance
+
+                    # Calculate idle time (when robot is not moving)
+                    if distance < 1.0:  # threshold for considering robot idle
+                        total_idle_time += self.collection_interval
+
+                self.robot_positions[robot.id] = (robot.x, robot.y)
+
+            avg_speed = total_speed / len(env.robots) if env.robots else 0
+            
+            # Calculate completion percentage
+            completion_percentage = (env.delivered_packages / env.total_packages * 100) if env.total_packages > 0 else 0
+
+            metrics = PerformanceMetrics(
+                timestamp=current_time - self.start_time,
+                delivered_packages=env.delivered_packages,
+                avg_robot_speed=avg_speed,
+                collision_count=self.collision_count,
+                path_length=total_path_length,
+                robot_idle_time=total_idle_time,
+                completion_percentage=completion_percentage
+            )
+
+            self.metrics_history.append(metrics)
+            self.last_collection_time = current_time
+            
+        except Exception as e:
+            print(f"Error updating metrics: {e}")
+
+    def save_metrics(self):
+        if not self.metrics_history:
+            print("Warning: No metrics to save!")
+            return
+
+        if not self.output_dir:
+            self.output_dir = os.getcwd()
+
+        # Convert metrics to dictionary format
+        metrics_data = []
+        for metric in self.metrics_history:
+            metrics_data.append({
+                'timestamp': metric.timestamp,
+                'delivered_packages': metric.delivered_packages,
+                'avg_robot_speed': metric.avg_robot_speed,
+                'collision_count': metric.collision_count,
+                'path_length': metric.path_length,
+                'robot_idle_time': metric.robot_idle_time,
+                'completion_percentage': metric.completion_percentage
+            })
+
+        # Generate filename with timestamp
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        base_filename = f'performance_metrics_{timestamp}'
+        
+        # Save raw data as JSON
+        json_path = os.path.join(self.output_dir, f'{base_filename}.json')
+        with open(json_path, 'w') as f:
+            json.dump(metrics_data, f, indent=4)
+
+        # Create visualizations
+        self.create_visualizations(os.path.join(self.output_dir, base_filename))
+        
+        # Print summary metrics
+        print("\nPerformance Summary:")
+        print(f"Total Time: {self.metrics_history[-1].timestamp:.2f} seconds")
+        print(f"Packages Delivered: {self.metrics_history[-1].delivered_packages}")
+        print(f"Average Speed: {sum(m.avg_robot_speed for m in self.metrics_history) / len(self.metrics_history):.2f} pixels/s")
+        print(f"Total Collisions: {self.metrics_history[-1].collision_count}")
+        print(f"Total Path Length: {self.metrics_history[-1].path_length:.2f} pixels")
+        print(f"Total Idle Time: {self.metrics_history[-1].robot_idle_time:.2f} seconds")
+
+    def create_visualizations(self, filename):
+        # Set the style for better visibility
+        plt.style.use('dark_background')
+        
+        # Convert metrics history to DataFrame for easier plotting
+        df = pd.DataFrame([vars(m) for m in self.metrics_history])
+
+        # Create a figure with multiple subplots
+        fig, axs = plt.subplots(3, 2, figsize=(15, 12), facecolor='black')
+        fig.suptitle('Robot System Performance Metrics', fontsize=16, color='white')
+
+        # Common parameters for all plots
+        plot_params = {
+            'linewidth': 2,
+            'marker': 'o',
+            'markersize': 4,
+            'markevery': max(1, len(df) // 20)  # Show markers at regular intervals
+        }
+
+        # Plot 1: Delivery Progress
+        axs[0, 0].plot(df['timestamp'], df['delivered_packages'], color='#00ff00', **plot_params)
+        self._style_subplot(axs[0, 0], 'Package Delivery Progress', 'Time (s)', 'Delivered Packages')
+
+        # Plot 2: Average Robot Speed
+        axs[0, 1].plot(df['timestamp'], df['avg_robot_speed'], color='#00ffff', **plot_params)
+        self._style_subplot(axs[0, 1], 'Average Robot Speed', 'Time (s)', 'Speed (pixels/s)')
+
+        # Plot 3: Collision Count
+        axs[1, 0].plot(df['timestamp'], df['collision_count'], color='#ff4444', **plot_params)
+        self._style_subplot(axs[1, 0], 'Cumulative Collision Count', 'Time (s)', 'Number of Collisions')
+
+        # Plot 4: Total Path Length
+        axs[1, 1].plot(df['timestamp'], df['path_length'], color='#ff00ff', **plot_params)
+        self._style_subplot(axs[1, 1], 'Total Path Length', 'Time (s)', 'Distance (pixels)')
+
+        # Plot 5: Robot Idle Time
+        axs[2, 0].plot(df['timestamp'], df['robot_idle_time'], color='#ffff00', **plot_params)
+        self._style_subplot(axs[2, 0], 'Robot Idle Time', 'Time (s)', 'Time (s)')
+
+        # Plot 6: Completion Percentage
+        axs[2, 1].plot(df['timestamp'], df['completion_percentage'], color='#ff8800', **plot_params)
+        self._style_subplot(axs[2, 1], 'Task Completion Percentage', 'Time (s)', 'Completion (%)')
+
+        # Adjust layout and save
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        
+        # Save with high DPI for better quality
+        plt.savefig(f'{filename}.png', 
+                   facecolor='black', 
+                   edgecolor='none', 
+                   dpi=300,
+                   bbox_inches='tight',
+                   pad_inches=0.5)
+        plt.close()
+
+    def _style_subplot(self, ax, title, xlabel, ylabel):
+        """Helper function to style each subplot consistently"""
+        ax.set_facecolor('black')
+        ax.grid(True, linestyle='--', alpha=0.3, color='white')
+        ax.set_title(title, color='white', pad=10, fontsize=12)
+        ax.set_xlabel(xlabel, color='white', fontsize=10)
+        ax.set_ylabel(ylabel, color='white', fontsize=10)
+        ax.tick_params(colors='white')
+        ax.spines['bottom'].set_color('white')
+        ax.spines['top'].set_color('white')
+        ax.spines['left'].set_color('white')
+        ax.spines['right'].set_color('white')
+        
+        # Add light gray background to tick labels for better readability
+        for label in ax.get_xticklabels() + ax.get_yticklabels():
+            label.set_bbox(dict(facecolor='black', edgecolor='none', alpha=0.7))
+
+        
+class DynamicObstacle(Obstacle):
+    def __init__(self, x: int, y: int, radius: int, speed: float):
+        super().__init__(x, y, radius)
+        self.speed = speed
+        self.direction = random.uniform(0, 2 * math.pi)
+        self.change_direction_counter = 0
+        self.target_x = x
+        self.target_y = y
+
+    def move(self, width: int, height: int):
+        if self.change_direction_counter <= 0:
+            self.direction = random.uniform(0, 2 * math.pi)
+            distance = random.uniform(50, 100)
+            self.target_x = self.x + distance * math.cos(self.direction)
+            self.target_y = self.y + distance * math.sin(self.direction)
+            self.change_direction_counter = int(distance / self.speed)
+
+        dx = self.target_x - self.x
+        dy = self.target_y - self.y
+        distance = math.sqrt(dx**2 + dy**2)
+
+        if distance > self.speed:
+            self.x += (dx / distance) * self.speed
+            self.y += (dy / distance) * self.speed
+        else:
+            self.x = self.target_x
+            self.y = self.target_y
+
+        self.x = max(self.radius, min(self.x, width - self.radius))
+        self.y = max(self.radius, min(self.y, height - self.radius))
+
+        self.change_direction_counter -= 1
+
+class Station:
+    def __init__(self, x: int, y: int, station_id: int, is_pickup: bool = False):
+        self.x = x
+        self.y = y
+        self.radius = 20
+        self.is_pickup = is_pickup
+        self.id = station_id
+        self.packages = 0
+
+    def collides_with(self, x: int, y: int) -> bool:
+        return math.sqrt((self.x - x)**2 + (self.y - y)**2) < self.radius
+
+    def render(self, screen):
+        color = YELLOW if self.is_pickup else GREY
+        pygame.draw.circle(screen, color, (int(self.x), int(self.y)), self.radius)
+        font = pygame.font.Font(None, 24)
+        text = font.render(f"{self.id}:{self.packages}", True, BLACK)
+        screen.blit(text, (int(self.x) - 15, int(self.y) - 8))
+
+class Robot:
+    def __init__(self, x: int, y: int, robot_id: int, env: 'Environment'):
+        self.x = x
+        self.y = y
+        self.radius = 10
+        self.env = env
+        self.carrying_object = False
+        self.target_station = None
+        self.speed = 3
+        self.id = robot_id
+        self.state = 'move_to_goal'
+        self.path = []
+        self.bug_state = 'move_to_goal'
+        self.bug_start = None
+        self.closest_point = None
+        self.lidar_data = []
+        self.communication_data = {}
+        self.stuck_counter = 0
+        self.avoid_collision_counter = 0
+        self.last_position = (x, y)
+        self.stuck_threshold = 20 
+        self.path_update_counter = 0
+        self.assigned_package=0
+        self.current_task = "Idle"
+        self.completed_tasks = 0
+        self.priority = robot_id  # Lower ID = Higher priority
+        self.collision_resolution = None  # Stores collision resolution direction
+        self.communication_text = None  # Stores communication message to display
+        self.text_display_timer = 0  # Controls how long to show the message
+        self.avoiding_collision_with = None  # Stores ID of robot being avoided
+
+
+
+    def move(self):
+        if not self.target_station:
+            self.get_next_task()
+        
+        if self.target_station:
+            self.path_update_counter += 1
+            if self.path_update_counter >= 30:  # Update path more frequently
+                self.update_lidar()
+                self.communicate_with_robots()
+                self.path = self.theta_star_path((self.x, self.y), (self.target_station.x, self.target_station.y))
+                self.path_update_counter = 0
+            
+            if self.path:
+                next_point = self.path[0]
+                if self.move_towards(next_point):
+                    self.path.pop(0)
+
+            self.check_if_stuck()
+            self.avoid_collision()
+            self.keep_in_bounds()
+
+    def render(self, screen):
+        
+        pygame.draw.circle(screen, BLUE, (int(self.x), int(self.y)), self.radius)
+        if self.carrying_object:
+            pygame.draw.circle(screen, YELLOW, (int(self.x), int(self.y)), 5)
+        font = pygame.font.Font(None, 24)
+        text = font.render(str(self.id), True, WHITE)
+        screen.blit(text, (int(self.x) - 6, int(self.y) - 8))
+        
+        # Render LiDAR
+        for distance, angle in self.lidar_data:
+            end_x = self.x + distance * math.cos(angle)
+            end_y = self.y + distance * math.sin(angle)
+            pygame.draw.line(screen, GREEN, (int(self.x), int(self.y)), (int(end_x), int(end_y)), 1)
+        
+        # Render path
+        if self.path:
+            for i in range(len(self.path) - 1):
+                pygame.draw.line(screen, GREEN, self.path[i], self.path[i+1], 2)
+
+        # Changed communication text color to WHITE
+        if self.communication_text and self.text_display_timer > 0:
+            font = pygame.font.Font(None, 20)
+            # Changed text color to WHITE here
+            text = font.render(self.communication_text, True, WHITE)
+            # Added a small black outline/shadow for better visibility
+            shadow = font.render(self.communication_text, True, BLACK)
+            # Draw shadow slightly offset for better readability against any background
+            screen.blit(shadow, (int(self.x) - 49, int(self.y) - 29))
+            screen.blit(shadow, (int(self.x) - 51, int(self.y) - 31))
+            screen.blit(text, (int(self.x) - 50, int(self.y) - 30))
+            self.text_display_timer -= 1
+            
+            if self.text_display_timer <= 0:
+                self.communication_text = None
+                
+        # Render collision avoidance direction if active
+        if self.collision_resolution:
+            direction_color = GREEN if self.priority == 0 else BLUE
+            direction_start = (int(self.x), int(self.y))
+            
+            if self.collision_resolution == "right":
+                direction_end = (int(self.x + 20), int(self.y))
+            else:
+                direction_end = (int(self.x - 20), int(self.y))
+                
+            pygame.draw.line(screen, direction_color, direction_start, direction_end, 2)
+
+    def move_towards(self, point):
+        dx = point[0] - self.x
+        dy = point[1] - self.y
+        distance = math.sqrt(dx**2 + dy**2)
+        
+        if distance < self.speed:
+            self.x, self.y = point
+            return True
+        else:
+            angle = math.atan2(dy, dx)
+            new_x = self.x + (dx / distance) * self.speed
+            new_y = self.y + (dy / distance) * self.speed
+            
+            if not self.check_collision(new_x, new_y):
+                self.x, self.y = new_x, new_y
+            else:
+                # If collision detected, try to move around the obstacle
+                for i in range(1, 8):  # Check 8 directions
+                    test_angle = angle + i * math.pi / 4
+                    test_x = self.x + math.cos(test_angle) * self.speed
+                    test_y = self.y + math.sin(test_angle) * self.speed
+                    if not self.check_collision(test_x, test_y):
+                        self.x, self.y = test_x, test_y
+                        break
+            return False
+        
+    def check_if_stuck(self):
+        current_position = (self.x, self.y)
+        if math.dist(current_position, self.last_position) < 0.1:
+            self.stuck_counter += 1
+        else:
+            self.stuck_counter = 0
+        
+        if self.stuck_counter > 50:  # If stuck for 50 frames
+            self.unstuck()
+        
+        self.last_position = current_position
+
+    def unstuck(self):
+        # Try to move in a random direction
+        angles = np.linspace(0, 2 * np.pi, 16, endpoint=False)
+        for angle in angles:
+            new_x = self.x + self.speed * 4 * math.cos(angle)
+            new_y = self.y + self.speed * 4 * math.sin(angle)
+            if not self.check_collision(new_x, new_y):
+                self.x, self.y = new_x, new_y
+                self.path = []  # Recalculate path
+                self.stuck_counter = 0
+                return
+        
+            
+    def avoid_collision(self):
+        for robot in self.env.robots:
+            if robot != self:
+                distance = math.dist((self.x, self.y), (robot.x, robot.y))
+                if distance < self.radius * 4:  # Increased threshold for earlier avoidance
+                    angle = math.atan2(self.y - robot.y, self.x - robot.x)
+                    new_x = self.x + math.cos(angle) * self.speed * 1.5  # Increased avoidance speed
+                    new_y = self.y + math.sin(angle) * self.speed * 1.5
+                    if not self.check_collision(new_x, new_y):
+                        self.x, self.y = new_x, new_y
+                    break
+        else:
+            self.avoid_collision_counter = 0
+    
+    def keep_in_bounds(self):
+        self.x = max(self.radius, min(self.x, SCREEN_WIDTH - self.radius))
+        self.y = max(self.radius, min(self.y, SCREEN_HEIGHT - self.radius))
+
+    def bug0_follow_obstacle(self):
+        angles = np.linspace(0, 2*np.pi, 36)
+        for angle in angles:
+            new_x = self.x + self.speed * np.cos(angle)
+            new_y = self.y + self.speed * np.sin(angle)
+            if not self.check_collision(new_x, new_y):
+                self.x, self.y = new_x, new_y
+                break
+        
+        current_distance = math.sqrt((self.x - self.target_station.x)**2 + (self.y - self.target_station.y)**2)
+        if current_distance < math.sqrt((self.closest_point[0] - self.target_station.x)**2 + 
+                                        (self.closest_point[1] - self.target_station.y)**2):
+            self.closest_point = (self.x, self.y)
+        
+        if self.can_move_to_goal():
+            self.bug_state = 'move_to_goal'
+            self.path = self.theta_star_path((self.x, self.y), (self.target_station.x, self.target_station.y))
+
+    def can_move_to_goal(self):
+        dx = self.target_station.x - self.x
+        dy = self.target_station.y - self.y
+        distance = math.sqrt(dx**2 + dy**2)
+        step_size = self.speed
+        steps = int(distance / step_size)
+        
+        for i in range(1, steps + 1):
+            x = self.x + (dx / distance) * step_size * i
+            y = self.y + (dy / distance) * step_size * i
+            if self.check_collision(x, y):
+                return False
+        return True
+
+    def theta_star_path(self, start, goal):
+        
+        def heuristic(a, b):
+            return math.sqrt((b[0] - a[0])**2 + (b[1] - a[1])**2)
+
+        def line_of_sight(start, end):
+            x0, y0 = int(start[0]), int(start[1])
+            x1, y1 = int(end[0]), int(end[1])
+            dx = abs(x1 - x0)
+            dy = abs(y1 - y0)
+            x = x0
+            y = y0
+            n = 1 + int(dx + dy)
+            x_inc = 1 if x1 > x0 else -1
+            y_inc = 1 if y1 > y0 else -1
+            error = dx - dy
+            dx *= 2
+            dy *= 2
+
+            for _ in range(n):
+                if self.check_collision(x, y):
+                    return False
+                if error > 0:
+                    x += x_inc
+                    error -= dy
+                else:
+                    y += y_inc
+                    error += dx
+
+            return True
+
+        start_node = (int(start[0] // GRID_SIZE), int(start[1] // GRID_SIZE))
+        goal_node = (int(goal[0] // GRID_SIZE), int(goal[1] // GRID_SIZE))
+
+        open_set = PriorityQueue()
+        open_set.put((0, start_node))
+        came_from = {}
+        g_score = {start_node: 0}
+        f_score = {start_node: heuristic(start_node, goal_node)}
+
+        while not open_set.empty():
+            current = open_set.get()[1]
+
+            if current == goal_node:
+                path = []
+                while current in came_from:
+                    path.append((current[0] * GRID_SIZE + GRID_SIZE // 2, 
+                                 current[1] * GRID_SIZE + GRID_SIZE // 2))
+                    current = came_from[current]
+                path.append(start)
+                return path[::-1]
+
+            for dx, dy in [(0, 1), (1, 0), (0, -1), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]:
+                neighbor = (current[0] + dx, current[1] + dy)
+                if 0 <= neighbor[0] < GRID_WIDTH and 0 <= neighbor[1] < GRID_HEIGHT:
+                    if line_of_sight(came_from.get(current, start), (neighbor[0] * GRID_SIZE, neighbor[1] * GRID_SIZE)):
+                        tentative_g_score = g_score[came_from.get(current, current)] + heuristic(came_from.get(current, current), neighbor)
+                    else:
+                        tentative_g_score = g_score[current] + heuristic(current, neighbor)
+                    
+                    if tentative_g_score < g_score.get(neighbor, float('inf')):
+                        came_from[neighbor] = came_from.get(current, current) if line_of_sight(came_from.get(current, start), (neighbor[0] * GRID_SIZE, neighbor[1] * GRID_SIZE)) else current
+                        g_score[neighbor] = tentative_g_score
+                        f_score[neighbor] = g_score[neighbor] + heuristic(neighbor, goal_node)
+                        open_set.put((f_score[neighbor], neighbor))
+
+        return None
+
+    def update_lidar(self):
+        self.lidar_data = []
+        for obstacle in self.env.obstacles + self.env.dynamic_obstacles + [r for r in self.env.robots if r != self]:
+            dx = obstacle.x - self.x
+            dy = obstacle.y - self.y
+            distance = math.sqrt(dx**2 + dy**2)
+            if distance <= LIDAR_RANGE:
+                angle = math.atan2(dy, dx)
+                self.lidar_data.append((distance, angle))
+
+    def communicate_with_robots(self):
+        messages = []
+        collision_resolutions = []
+        
+        for robot in self.env.robots:
+            if robot != self:
+                dx = robot.x - self.x
+                dy = robot.y - self.y
+                distance = math.sqrt(dx**2 + dy**2)
+                
+                if distance <= COMMUNICATION_RANGE:
+                    # Basic status communication
+                    message = {
+                        'robot_id': self.id,
+                        'to_robot_id': robot.id,
+                        'current_task': self.current_task,
+                        'completed_tasks': self.completed_tasks,
+                        'carrying_object': self.carrying_object,
+                        'target_station': self.target_station.id if self.target_station else None,
+                        'priority': self.priority
+                    }
+                    messages.append(message)
+                    
+                    # Collision avoidance protocol
+                    if distance < self.radius * 6:  # Collision detection range
+                        resolution = self.negotiate_collision_avoidance(robot, dx, dy)
+                        collision_resolutions.append(resolution)
+                        
+                        # Display communication text
+                        self.communication_text = f"R{self.id}: {resolution['action']} for R{robot.id}"
+                        self.text_display_timer = 60  # Show for 60 frames
+                        
+                        if resolution['initiator']:
+                            robot.receive_collision_resolution(resolution)
+        
+        return messages, collision_resolutions
+
+    def negotiate_collision_avoidance(self, other_robot, dx, dy):
+        angle = math.atan2(dy, dx)
+        relative_angle = math.degrees(angle) % 360
+        
+        # Determine who has priority
+        has_priority = self.priority < other_robot.priority
+        
+        # Decide avoidance direction based on relative position and priority
+        if has_priority:
+            if 0 <= relative_angle < 180:
+                action = "moving right"
+                self.collision_resolution = "right"
+                other_resolution = "left"
+            else:
+                action = "moving left"
+                self.collision_resolution = "left"
+                other_resolution = "right"
+        else:
+            if 0 <= relative_angle < 180:
+                action = "yielding left"
+                self.collision_resolution = "left"
+                other_resolution = "right"
+            else:
+                action = "yielding right"
+                self.collision_resolution = "right"
+                other_resolution = "left"
+        
+        return {
+            'initiator': has_priority,
+            'initiator_id': self.id,
+            'receiver_id': other_robot.id,
+            'action': action,
+            'resolution': self.collision_resolution,
+            'other_resolution': other_resolution
+        }
+
+    def receive_collision_resolution(self, resolution):
+        if resolution['receiver_id'] == self.id:
+            self.collision_resolution = resolution['other_resolution']
+            self.avoiding_collision_with = resolution['initiator_id']
+            self.communication_text = f"R{self.id}: Acknowledged {resolution['action']}"
+            self.text_display_timer = 60
+
+    def avoid_collision(self):
+        if self.collision_resolution:
+            speed_multiplier = 1.5
+            avoided = False
+            
+            for robot in self.env.robots:
+                if robot != self:
+                    distance = math.dist((self.x, self.y), (robot.x, robot.y))
+                    if distance < self.radius * 4:
+                        angle = math.atan2(self.y - robot.y, self.x - robot.x)
+                        
+                        if self.collision_resolution == "right":
+                            angle += math.pi / 2  # Turn 90 degrees right
+                        else:
+                            angle -= math.pi / 2  # Turn 90 degrees left
+                            
+                        new_x = self.x + math.cos(angle) * self.speed * speed_multiplier
+                        new_y = self.y + math.sin(angle) * self.speed * speed_multiplier
+                        
+                        if not self.check_collision(new_x, new_y):
+                            self.x, self.y = new_x, new_y
+                            avoided = True
+                            break
+            
+            if not avoided:
+                self.collision_resolution = None
+                self.avoiding_collision_with = None
+
+    def check_collision(self, x: float, y: float) -> bool:
+        grid_x, grid_y = int(x // GRID_SIZE), int(y // GRID_SIZE)
+        if 0 <= grid_x < GRID_WIDTH and 0 <= grid_y < GRID_HEIGHT:
+            if self.env.grid[grid_x][grid_y] == 1:
+                return True
+        return any(obstacle.collides_with(x, y) for obstacle in self.env.dynamic_obstacles) or \
+               any(robot.collides_with(x, y) for robot in self.env.robots if robot != self)
+
+    def get_next_task(self):
+        if not self.carrying_object and self.env.pickup_station.packages > 0:
+            self.target_station = self.env.pickup_station
+            self.current_task = "Moving to pickup"
+        elif self.carrying_object:
+            delivery_stations = [station for station in self.env.delivery_stations if station.packages > 0]
+            if delivery_stations:
+                self.target_station = min(delivery_stations, key=lambda s: math.sqrt((s.x - self.x)**2 + (s.y - self.y)**2))
+                self.current_task = f"Delivering to Station {self.target_station.id}"
+            else:
+                self.target_station = self.env.pickup_station
+                self.current_task = "Returning to pickup"
+        else:
+            self.target_station = self.env.pickup_station
+            self.current_task = "Returning to pickup"
+    
+
+    def interact_with_station(self):
+        if self.target_station and self.target_station.collides_with(self.x, self.y):
+            if self.target_station.is_pickup and not self.carrying_object:
+                if self.target_station.packages > 0:
+                    self.carrying_object = True
+                    self.target_station.packages -= 1
+                    self.assigned_package += 1
+                    self.completed_tasks += 1
+                    print(f"Robot {self.id} picked up object from pickup station")
+            elif not self.target_station.is_pickup and self.carrying_object:
+                if self.target_station.packages > 0:
+                    self.carrying_object = False
+                    self.target_station.packages -= 1
+                    self.env.delivered_packages += 1
+                    self.completed_tasks += 1
+                    print(f"Robot {self.id} delivered object to station {self.target_station.id}")
+            self.target_station = None
+            self.path = []
+            self.get_next_task()
+
+    
+                
+    def collides_with(self, x: int, y: int) -> bool:
+        return math.sqrt((self.x - x)**2 + (self.y - y)**2) < self.radius + 5
+
+    
+
+class Environment:
+    def __init__(self, output_dir=None):
+        pygame.init()
+        self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+        pygame.display.set_caption("Robot Logistics System")
+        self.clock = pygame.time.Clock()
+        try:
+            self.background = pygame.image.load(r"C:\Users\admin\Downloads\space bg.jpg")
+            self.background = pygame.transform.scale(self.background, (SCREEN_WIDTH, SCREEN_HEIGHT))
+        except pygame.error as e:
+            print(f"Could not load background image: {e}")
+            self.background = None
+
+        self.pickup_station = Station(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2, 0, is_pickup=True)
+        self.delivery_stations = [Station(random.randint(0, SCREEN_WIDTH), random.randint(0, SCREEN_HEIGHT), i+1) 
+                                for i in range(NUM_STATIONS)]
+        
+        self.obstacles = self.generate_obstacles()
+        self.dynamic_obstacles = self.generate_dynamic_obstacles()
+        
+        self.robots = [Robot(random.randint(0, SCREEN_WIDTH), random.randint(0, SCREEN_HEIGHT), i, self) 
+                      for i in range(NUM_ROBOTS)]
+
+        self.grid = self.compute_grid()
+        self.update_counter = 0
+        self.total_packages = 0
+        self.delivered_packages = 0
+        self.performance_monitor = PerformanceMonitor(output_dir=output_dir)
+        self.simulation_complete = False
+        
+    def compute_grid(self):
+        grid = [[0 for _ in range(GRID_HEIGHT)] for _ in range(GRID_WIDTH)]
+        for obstacle in self.obstacles + self.dynamic_obstacles:
+            for x in range(max(0, int((obstacle.x - obstacle.radius) // GRID_SIZE)), 
+                           min(GRID_WIDTH, int((obstacle.x + obstacle.radius) // GRID_SIZE) + 1)):
+                for y in range(max(0, int((obstacle.y - obstacle.radius) // GRID_SIZE)), 
+                               min(GRID_HEIGHT, int((obstacle.y + obstacle.radius) // GRID_SIZE) + 1)):
+                    if obstacle.collides_with(x * GRID_SIZE, y * GRID_SIZE):
+                        grid[x][y] = 1
+        return grid
+
+
+    def get_station_by_id(self, station_id: int) -> Station:
+        
+        if station_id == 0:
+            return self.pickup_station
+        return self.delivery_stations[station_id - 1]
+
+    def generate_obstacles(self):
+        obstacles = []
+        for _ in range(NUM_OBSTACLES):
+            while True:
+                x = random.randint(0, SCREEN_WIDTH)
+                y = random.randint(0, SCREEN_HEIGHT)
+                if not self.is_near_station(x, y):
+                    obstacles.append(Obstacle(x, y, 15))
+                    break
+        return obstacles
+
+    def generate_dynamic_obstacles(self):
+        dynamic_obstacles = []
+        for _ in range(NUM_OBSTACLES):
+            while True:
+                x = random.randint(0, SCREEN_WIDTH)
+                y = random.randint(0, SCREEN_HEIGHT)
+                if not self.is_near_station(x, y):
+                    dynamic_obstacles.append(DynamicObstacle(x, y, 15, random.uniform(1, 3)))
+                    break
+        return dynamic_obstacles
+
+    def is_near_station(self, x, y):
+        stations = [self.pickup_station] + self.delivery_stations
+        for station in stations:
+            if math.sqrt((x - station.x)**2 + (y - station.y)**2) < 50:  # 50 is the minimum distance from stations
+                return True
+        return False
+
+    def update(self):
+        self.update_counter += 1
+        if self.update_counter >= 10:
+            self.grid = self.compute_grid()
+            self.update_counter = 0
+
+        for obstacle in self.dynamic_obstacles:
+            obstacle.move(SCREEN_WIDTH, SCREEN_HEIGHT)
+        
+        all_messages = []
+        for robot in sorted(self.robots, key=lambda x: x.priority):  # Process in priority order
+            robot.move()
+            robot.interact_with_station()
+            messages, resolutions = robot.communicate_with_robots()
+            all_messages.extend(zip(messages, [resolutions]))
+        
+        self.print_communication_table(all_messages)
+        self.performance_monitor.update(self)
+        
+        if self.delivered_packages >= self.total_packages:
+            self.reassign_tasks()
+
+    def print_communication_table(self, messages):
+        if messages:
+            table_data = []
+            for msg, resolutions in messages:
+                status = f"Priority: {msg['priority']}"
+                if resolutions:
+                    status += f" | {resolutions[0]['action']}"
+                    
+                table_data.append([
+                    f"Robot {msg['robot_id']} -> Robot {msg['to_robot_id']}",
+                    msg['current_task'],
+                    status,
+                    "Yes" if msg['carrying_object'] else "No",
+                    f"Station {msg['target_station']}" if msg['target_station'] is not None else "None"
+                ])
+                
+            headers = ["Communication", "Current Task", "Status", "Carrying Object", "Target Station"]
+            print(tabulate(table_data, headers=headers, tablefmt="grid"))
+            print("\n")
+            
+    def reassign_tasks(self):
+        all_tasks_completed = all(robot.target_station == self.pickup_station for robot in self.robots)
+        if all_tasks_completed:
+            print("All tasks completed. Simulation ending.")
+            self.simulation_complete = True
+        else:
+            for robot in self.robots:
+                if robot.target_station != self.pickup_station:
+                    robot.get_next_task()
+
+
+    def render(self):
+        if self.background:
+            self.screen.blit(self.background, (0, 0))
+        else:
+            self.screen.fill(WHITE)
+        
+        # Draw semi-transparent grid overlay
+        grid_surface = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+        for x in range(0, SCREEN_WIDTH, GRID_SIZE):
+            pygame.draw.line(grid_surface, (200, 200, 200, 128), (x, 0), (x, SCREEN_HEIGHT))
+        for y in range(0, SCREEN_HEIGHT, GRID_SIZE):
+            pygame.draw.line(grid_surface, (200, 200, 200, 128), (0, y), (SCREEN_WIDTH, y))
+        self.screen.blit(grid_surface, (0, 0))
+        
+        for obstacle in self.obstacles + self.dynamic_obstacles:
+            obstacle.render(self.screen)
+        
+        self.pickup_station.render(self.screen)
+        for station in self.delivery_stations:
+            station.render(self.screen)
+        
+        for robot in self.robots:
+            robot.render(self.screen)
+        
+        pygame.display.flip()
+        
+    def run(self):
+        running = True
+        step = 0
+        try:
+            while running and step < MAX_STEPS and not self.simulation_complete:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        running = False
+
+                self.update()
+                self.render()
+                self.clock.tick(FPS)
+                step += 1
+        except Exception as e:
+            print(f"Error during simulation: {e}")
+        finally:
+            # Ensure metrics are saved before closing
+            if hasattr(self, 'performance_monitor'):
+                try:
+                    self.performance_monitor.save_metrics()
+                    print("Performance metrics saved successfully.")
+                except Exception as e:
+                    print(f"Error saving metrics: {e}")
+            
+            pygame.quit()
+
+
+def create_output_directory():
+    """Create a directory for storing simulation outputs"""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    output_dir = f'simulation_output_{timestamp}'
+    os.makedirs(output_dir, exist_ok=True)
+    return output_dir
+
+def print_simulation_header(tasks):
+    """Print simulation configuration details"""
+    print("\n" + "="*50)
+    print("Robot Logistics System Simulation")
+    print("="*50)
+    print(f"Number of Robots: {NUM_ROBOTS}")
+    print(f"Number of Stations: {NUM_STATIONS}")
+    print(f"Number of Obstacles: {NUM_OBSTACLES}")
+    print("\nTask Distribution:")
+    for station_id, packages in tasks.items():
+        print(f"Station {station_id}: {packages} packages")
+    print("="*50 + "\n")
+
+def get_user_tasks():
+    """Get task distribution from user with input validation"""
+    print("\nEnter package distribution for delivery stations:")
+    tasks = {}
+    total_packages = 0
+    
+    for i in range(1, NUM_STATIONS + 1):
+        while True:
+            try:
+                packages = int(input(f"Enter number of packages for Station {i}: "))
+                if packages >= 0:
+                    tasks[i] = packages
+                    total_packages += packages
+                    break
+                else:
+                    print("Invalid input. Please enter a non-negative integer.")
+            except ValueError:
+                print("Invalid input. Please enter a number.")
+    
+    print(f"\nTotal packages to be delivered: {total_packages}")
+    return tasks
+
+def run_simulation():
+    """Run the main simulation with enhanced metrics handling"""
+    try:
+        # Create output directory
+        output_dir = create_output_directory()
+        print(f"Created output directory: {output_dir}")
+        
+        # Get task distribution
+        user_tasks = get_user_tasks()
+        
+        # Print simulation configuration
+        print_simulation_header(user_tasks)
+        
+        # Initialize environment with output directory
+        env = Environment(output_dir=output_dir)
+        env.total_packages = sum(user_tasks.values())
+        env.pickup_station.packages = env.total_packages
+        
+        # Distribute packages to stations
+        for station_id, packages in user_tasks.items():
+            env.get_station_by_id(station_id).packages = packages
+        
+        # Run simulation
+        env.run()
+        
+        print(f"\nSimulation completed. Output saved to: {output_dir}")
+        
+    except Exception as e:
+        print(f"Error during simulation: {e}")
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    run_simulation()
+   
